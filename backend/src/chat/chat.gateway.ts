@@ -1,0 +1,201 @@
+import {
+  WebSocketGateway,
+  SubscribeMessage,
+  MessageBody,
+  ConnectedSocket,
+  WebSocketServer,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+import { ChatService } from './chat.service';
+import { RedisService } from './redis.service';
+import { UsersService } from '../users/users.service';
+import { SenderType } from './entities/message.entity';
+import { RoomStatus } from './entities/room.entity';
+import { UserRole, UserStatus } from '../users/entities/user.entity';
+
+@WebSocketGateway({
+  cors: {
+    origin: '*',
+  },
+})
+export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
+  @WebSocketServer()
+  server: Server;
+
+  constructor(
+    private readonly chatService: ChatService,
+    private readonly redisService: RedisService,
+    private readonly usersService: UsersService,
+  ) {}
+
+  async handleConnection(client: Socket) {
+    console.log(`Socket connection: ${client.id}`);
+  }
+
+  async handleDisconnect(client: Socket) {
+    const operatorId = client.data.operatorId || client.handshake.query.operatorId as string;
+    if (operatorId) {
+      await this.redisService.setStatus(operatorId, 'offline');
+      await this.usersService.updateStatus(Number(operatorId), UserStatus.OFFLINE);
+      this.server.emit('operator:status', { operatorId, status: 'offline' });
+    }
+
+    const clientId = client.data.clientId;
+    
+    // Notify rooms about disconnection and close them if it's a client
+    const rooms = Array.from(client.rooms);
+    for (const roomId of rooms) {
+      if (roomId !== client.id) {
+        this.server.to(roomId).emit('user:left', { userId: client.id, roomId });
+        
+        // If it's the client of this room, mark it as closed
+        if (clientId) {
+          await this.chatService.updateRoomStatus(roomId, RoomStatus.CLOSED);
+          this.server.to(roomId).emit('room:status', { roomId, status: RoomStatus.CLOSED });
+          
+          const room = await this.chatService.findRoom(roomId);
+          this.server.to(roomId).emit('room:updated', room);
+        }
+      }
+    }
+    console.log(`Client disconnected: ${client.id}`);
+  }
+
+  @SubscribeMessage('operator:status')
+  async handleOperatorStatus(
+    @MessageBody() data: { operatorId: string; status: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    await this.redisService.setStatus(data.operatorId, data.status);
+    this.server.emit('operator:status', data);
+  }
+
+  @SubscribeMessage('room:init')
+  async handleRoomInit(
+    @MessageBody() data: { 
+      clientId: string; 
+      message?: string;
+      clientName?: string;
+      clientContact?: string;
+      topic?: string;
+    },
+    @ConnectedSocket() client: Socket,
+  ) {
+    client.data.clientId = data.clientId; // Store clientId on socket
+    const room = await this.chatService.createRoom(
+      data.clientId,
+      data.clientName,
+      data.clientContact,
+      data.topic
+    );
+    client.join(room.id);
+    
+    if (data.message) {
+      const savedMessage = await this.chatService.saveMessage(
+        room.id,
+        SenderType.CLIENT,
+        data.clientId,
+        data.message,
+      );
+      room.messages = [savedMessage];
+    }
+    
+    client.emit('room:created', room);
+    this.server.emit('room:waiting', room); // Notify operators
+  }
+
+  @SubscribeMessage('operator:identify')
+  async handleOperatorIdentify(
+    @MessageBody() data: { operatorId: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    client.data.operatorId = data.operatorId;
+    await this.redisService.setStatus(data.operatorId, 'online');
+    await this.usersService.updateStatus(Number(data.operatorId), UserStatus.ONLINE);
+    this.server.emit('operator:status', { operatorId: data.operatorId, status: 'online' });
+  }
+
+  @SubscribeMessage('room:join')
+  async handleRoomJoin(
+    @MessageBody() data: { roomId: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const operatorId = client.data.operatorId;
+    const room = await this.chatService.findRoom(data.roomId);
+    
+    if (room && room.status === RoomStatus.WAITING && operatorId) {
+      await this.chatService.assignRoom(data.roomId, operatorId);
+      const updatedRoom = await this.chatService.findRoom(data.roomId);
+      this.server.to(data.roomId).emit('room:updated', updatedRoom);
+      this.server.emit('room:assigned', { roomId: data.roomId, operatorId });
+    }
+    
+    this.server.to(data.roomId).emit('user:joined', { userId: client.id, roomId: data.roomId });
+    client.join(data.roomId);
+  }
+
+  @SubscribeMessage('room:close')
+  async handleRoomClose(
+    @MessageBody() data: { roomId: string },
+  ) {
+    await this.chatService.updateRoomStatus(data.roomId, RoomStatus.CLOSED);
+    this.server.to(data.roomId).emit('room:status', { roomId: data.roomId, status: RoomStatus.CLOSED });
+    
+    const room = await this.chatService.findRoom(data.roomId);
+    this.server.to(data.roomId).emit('room:updated', room);
+  }
+
+  @SubscribeMessage('room:get_all')
+  async handleGetAllRooms(@ConnectedSocket() client: Socket) {
+    const operatorId = client.data.operatorId;
+    let role: UserRole | undefined;
+
+    if (operatorId) {
+      const user = await this.usersService.findById(Number(operatorId));
+      role = user?.role;
+    }
+
+    const rooms = await this.chatService.findAllRooms(operatorId, role);
+    client.emit('rooms:all', rooms);
+  }
+
+  @SubscribeMessage('message:send')
+  async handleMessage(
+    @MessageBody() data: { roomId: string; senderId: string; senderType: SenderType; content: string },
+  ) {
+    const room = await this.chatService.findRoom(data.roomId);
+    if (!room || room.status === RoomStatus.CLOSED) {
+      return; // Reject messages to closed rooms
+    }
+
+    const message = await this.chatService.saveMessage(
+      data.roomId,
+      data.senderType,
+      data.senderId,
+      data.content,
+    );
+    this.server.to(data.roomId).emit('message:receive', message);
+    this.server.emit('message:global_signal', { roomId: data.roomId }); // For global analytics
+  }
+
+  @SubscribeMessage('user:typing')
+  handleTyping(
+    @MessageBody() data: { roomId: string; senderId: string; isTyping: boolean },
+  ) {
+    this.server.to(data.roomId).emit('user:typing', data);
+  }
+
+  @SubscribeMessage('feedback:submit')
+  async handleFeedbackSubmit(
+    @MessageBody() data: { roomId: string; rating: number; isResolved: boolean; comment: string },
+  ) {
+    await this.chatService.saveFeedback(
+      data.roomId,
+      data.rating,
+      data.isResolved,
+      data.comment,
+    );
+  }
+}
