@@ -30,6 +30,7 @@
     "@nestjs/typeorm": "^11.0.1",
     "@nestjs/websockets": "^11.1.18",
     "bcrypt": "^6.0.0",
+    "msnodesqlv8": "^5.1.8",
     "mssql": "^12.2.1",
     "mysql2": "^3.20.0",
     "passport": "^0.7.0",

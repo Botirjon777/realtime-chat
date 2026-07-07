@@ -6,8 +6,12 @@ export const useSocket = (url: string) => {
   const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
-    const socket = io(url, {
-      transports: ['websocket'],
+    // If the URL is our API proxy prefix, we just use an empty string for the WS target
+    // so socket.io connects to the root hostname and hits our /socket.io/ rewrite cleanly.
+    const socketTargetUrl = url === "/api" ? "" : url;
+    const socket = io(socketTargetUrl, {
+      // By removing `transports: ['websocket']`, the client is allowed to use HTTP Long-Polling
+      // which seamlessly passes through Next.js proxy rewrite rules and Ngrok without dropping the connection.
     });
 
     socket.on('connect', () => {
