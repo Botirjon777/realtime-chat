@@ -214,21 +214,22 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const notEscalated = !room.requestedOperator;
 
     if (isClientMessage && noOperator && notEscalated) {
-      // Build conversation history from room messages (latest 10 pairs for context)
+      // Build conversation history from room messages (last 10 exchanges for context)
       const allMessages = room.messages || [];
       const history: OllamaMessage[] = allMessages
         .slice(-10)
         .filter((m) => m.senderType === SenderType.CLIENT || m.senderType === SenderType.BOT)
         .map((m) => ({
-          role: m.senderType === SenderType.CLIENT ? 'user' : 'assistant',
+          role: (m.senderType === SenderType.CLIENT ? 'user' : 'assistant') as 'user' | 'assistant',
           content: m.content,
         }));
 
-      // Append the latest message (already saved above) to history
-      history.push({ role: 'user', content: data.content });
-
-      const systemPrompt = this.ollamaService.buildSystemPrompt(room.topic);
-      const aiReply = await this.ollamaService.chat(history, systemPrompt);
+      // Search products DB + inject results as context → ask Ollama
+      const aiReply = await this.ollamaService.chatWithProductContext(
+        data.content,
+        history,
+        room.topic,
+      );
 
       const botMessage = await this.chatService.saveMessage(
         data.roomId,
