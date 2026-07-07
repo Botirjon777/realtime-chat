@@ -2,7 +2,7 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   /* config options here */
-  allowedDevOrigins: ["192.168.0.41", 'markus-megathermic-revocably.ngrok-free.dev'],
+  allowedDevOrigins: ["192.168.0.41", "192.168.10.90", 'markus-megathermic-revocably.ngrok-free.dev'],
   async rewrites() {
     return [
       {
