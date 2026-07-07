@@ -7,6 +7,7 @@ import {
   OnGatewayConnection,
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
+import { Logger } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { ChatService } from './chat.service';
 import { RedisService } from './redis.service';
@@ -24,6 +25,8 @@ import { OllamaService, OllamaMessage } from '../ollama/ollama.service';
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
+
+  private readonly logger = new Logger(ChatGateway.name);
 
   constructor(
     private readonly chatService: ChatService,
@@ -189,57 +192,61 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   async handleMessage(
     @MessageBody() data: { roomId: string; senderId: string; senderType: SenderType; content: string },
   ) {
-    const room = await this.chatService.findRoom(data.roomId);
-    if (!room || room.status === RoomStatus.CLOSED) {
-      return; // Reject messages to closed rooms
-    }
+    try {
+      const room = await this.chatService.findRoom(data.roomId);
+      if (!room || room.status === RoomStatus.CLOSED) {
+        return; // Reject messages to closed rooms
+      }
 
-    // Save the client's message
-    const message = await this.chatService.saveMessage(
-      data.roomId,
-      data.senderType,
-      data.senderId,
-      data.content,
-    );
-    this.server.to(data.roomId).emit('message:receive', message);
-    this.server.emit('message:global_signal', { roomId: data.roomId });
-
-    // ── AI auto-reply ─────────────────────────────────────────────────────────
-    // Route to Ollama only when:
-    //   1. Sender is client
-    //   2. No human operator has joined
-    //   3. Client has NOT requested a human operator
-    const isClientMessage = data.senderType === SenderType.CLIENT;
-    const noOperator = !room.operatorId;
-    const notEscalated = !room.requestedOperator;
-
-    if (isClientMessage && noOperator && notEscalated) {
-      // Build conversation history from room messages (last 10 exchanges for context)
-      const allMessages = room.messages || [];
-      const history: OllamaMessage[] = allMessages
-        .slice(-10)
-        .filter((m) => m.senderType === SenderType.CLIENT || m.senderType === SenderType.BOT)
-        .map((m) => ({
-          role: (m.senderType === SenderType.CLIENT ? 'user' : 'assistant') as 'user' | 'assistant',
-          content: m.content,
-        }));
-
-      // Search products DB + inject results as context → ask Ollama
-      const aiReply = await this.ollamaService.chatWithProductContext(
-        data.content,
-        history,
-        room.topic,
-      );
-
-      const botMessage = await this.chatService.saveMessage(
+      // Save the client's message and broadcast it immediately
+      const message = await this.chatService.saveMessage(
         data.roomId,
-        SenderType.BOT,
-        'ai-bot',
-        aiReply,
+        data.senderType,
+        data.senderId,
+        data.content,
       );
-      this.server.to(data.roomId).emit('message:receive', botMessage);
+      this.server.to(data.roomId).emit('message:receive', message);
+      this.server.emit('message:global_signal', { roomId: data.roomId });
+
+      // ── AI auto-reply ───────────────────────────────────────────────────────
+      // Route to Ollama only when:
+      //   1. Sender is client
+      //   2. No human operator has joined
+      //   3. Client has NOT requested a human operator
+      const isClientMessage = data.senderType === SenderType.CLIENT;
+      const noOperator = !room.operatorId;
+      const notEscalated = !room.requestedOperator;
+
+      if (isClientMessage && noOperator && notEscalated) {
+        // Build conversation history from room messages (last 10 exchanges)
+        const allMessages = room.messages || [];
+        const history: OllamaMessage[] = allMessages
+          .slice(-10)
+          .filter((m) => m.senderType === SenderType.CLIENT || m.senderType === SenderType.BOT)
+          .map((m) => ({
+            role: (m.senderType === SenderType.CLIENT ? 'user' : 'assistant') as 'user' | 'assistant',
+            content: m.content,
+          }));
+
+        // Search products DB + inject as context → Ollama reply
+        const aiReply = await this.ollamaService.chatWithProductContext(
+          data.content,
+          history,
+          room.topic,
+        );
+
+        const botMessage = await this.chatService.saveMessage(
+          data.roomId,
+          SenderType.BOT,
+          'ai-bot',
+          aiReply,
+        );
+        this.server.to(data.roomId).emit('message:receive', botMessage);
+      }
+      // ───────────────────────────────────────────────────────────────────────
+    } catch (err: any) {
+      this.logger.error(`handleMessage error: ${err.message}`, err.stack);
     }
-    // ─────────────────────────────────────────────────────────────────────────
   }
 
   // ── New: Client requests a human operator ──────────────────────────────────

@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Like, ILike } from 'typeorm';
+import { Repository, Like } from 'typeorm';
 import { Product } from './product.entity';
 
 export interface ProductResult {
@@ -41,10 +41,11 @@ export class ProductsService {
 
     try {
       // Build dynamic OR conditions for each keyword
+      // Note: Use Like (not ILike) — MSSQL's LIKE is already case-insensitive
       const conditions = keywords.flatMap(kw => [
-        { title: ILike(`%${kw}%`) },
-        { sku: ILike(`%${kw}%`) },
-        { vendor: ILike(`%${kw}%`) },
+        { title: Like(`%${kw}%`) },
+        { sku: Like(`%${kw}%`) },
+        { vendor: Like(`%${kw}%`) },
       ]);
 
       const products = await this.productRepository.find({
