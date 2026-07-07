@@ -214,33 +214,42 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const notEscalated = !room.requestedOperator;
 
       if (isClientMessage && noOperator && notEscalated) {
-        // Build conversation history from room messages (last 10 exchanges)
+        // Build conversation history (last 6 exchanges to keep prompt short)
         const allMessages = room.messages || [];
         const history: OllamaMessage[] = allMessages
-          .slice(-10)
+          .slice(-6)
           .filter((m) => m.senderType === SenderType.CLIENT || m.senderType === SenderType.BOT)
           .map((m) => ({
             role: (m.senderType === SenderType.CLIENT ? 'user' : 'assistant') as 'user' | 'assistant',
             content: m.content,
           }));
 
-        // Signal frontend that bot is composing a reply
-        this.server.to(data.roomId).emit('bot:typing', { roomId: data.roomId });
+        // Tell the client a streaming bot message is starting
+        const tempId = Date.now();
+        this.server.to(data.roomId).emit('bot:stream_start', { roomId: data.roomId, tempId });
 
-        // Search products DB + inject as context → Ollama reply
-        const aiReply = await this.ollamaService.chatWithProductContext(
+        // Stream chunks to the room as Ollama generates them
+        const fullReply = await this.ollamaService.chatWithProductContextStream(
           data.content,
           history,
           room.topic,
+          (chunk: string) => {
+            this.server.to(data.roomId).emit('bot:chunk', { roomId: data.roomId, tempId, chunk });
+          },
         );
 
+        // Save the complete message and notify the client to replace streaming bubble
         const botMessage = await this.chatService.saveMessage(
           data.roomId,
           SenderType.BOT,
           'ai-bot',
-          aiReply,
+          fullReply,
         );
-        this.server.to(data.roomId).emit('message:receive', botMessage);
+        this.server.to(data.roomId).emit('bot:stream_done', {
+          roomId: data.roomId,
+          tempId,
+          message: botMessage,
+        });
       }
       // ───────────────────────────────────────────────────────────────────────
     } catch (err: any) {

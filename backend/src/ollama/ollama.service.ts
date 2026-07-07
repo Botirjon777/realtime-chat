@@ -22,7 +22,7 @@ export class OllamaService {
     this.ollamaUrl =
       this.configService.get<string>('OLLAMA_URL') || 'http://localhost:11434';
     this.model =
-      this.configService.get<string>('OLLAMA_MODEL') || 'llama3:8b';
+      this.configService.get<string>('OLLAMA_MODEL') || 'qwen2.5:3b';
     this.storeName =
       this.configService.get<string>('STORE_NAME') || 'MAINFrame Custom Cables Store';
     this.botName =
@@ -33,36 +33,36 @@ export class OllamaService {
     return `You are ${this.botName}, the AI support assistant for "${this.storeName}".
 We specialize in custom cables, cable sleeving, connectors, power supply cables, and PC modding accessories.
 
-STRICT RULES:
-1. ONLY answer questions related to "${this.storeName}" — our cables, products, orders, shipping, returns, and support.
-2. If a customer asks about anything unrelated to our store or cables (e.g. competitors, general tech questions, coding, etc.), politely decline and offer to help with our products.
-3. Never recommend or mention other stores or brands outside our catalog.
-4. Be concise, enthusiastic, and professional. Keep responses clear and to the point.
-5. When recommending products, always include the SKU, price, and availability status.
-6. If a product is out of stock, suggest similar in-stock alternatives if available.
-7. If you cannot find a matching product, say so honestly and offer to connect the customer with a human operator.
-8. If the customer is frustrated or requests a human, tell them to click the "Talk to operator" button.
-${topic ? `9. The customer's topic is: "${topic}". Tailor your response accordingly.` : ''}
+RULES:
+1. ONLY answer questions related to "${this.storeName}" — cables, products, orders, shipping, returns.
+2. If a customer asks about unrelated topics, politely redirect to our products.
+3. Never recommend other stores or brands.
+4. Be concise and friendly. Keep responses short and to the point.
+5. When recommending products, include SKU, price, and availability.
+6. If out of stock, suggest in-stock alternatives if available.
+7. If no match found, say so and offer to connect with a human operator.
+8. If customer asks for a human, tell them to click "Talk to operator".
+${topic ? `9. Customer topic: "${topic}".` : ''}
 
-${productContext ? `LIVE PRODUCT DATA FROM OUR DATABASE:\n${productContext}\n\nIMPORTANT: Use ONLY the products listed above when making recommendations. Do not invent product names, prices, or SKUs.` : 'No specific product matches found yet. Ask the customer what type of cable or product they need.'}`;
+${productContext
+  ? `LIVE PRODUCT DATA FROM OUR DATABASE:\n${productContext}\n\nIMPORTANT: Use ONLY the products listed above. Do not invent SKUs, prices, or product names.`
+  : 'No product matches yet. Ask what type of cable or product they need.'}`;
   }
 
-  async chat(
+  /**
+   * Streaming chat — calls Ollama with stream:true and invokes onChunk for each token.
+   * Returns the full assembled reply when done.
+   */
+  async chatStream(
     messages: OllamaMessage[],
-    systemPrompt?: string,
+    systemPrompt: string,
+    onChunk: (chunk: string) => void,
   ): Promise<string> {
     const url = `${this.ollamaUrl}/api/chat`;
-
     const payload = {
       model: this.model,
-      stream: false,
-      messages: [
-        {
-          role: 'system',
-          content: systemPrompt || this.buildSystemPrompt(),
-        },
-        ...messages,
-      ],
+      stream: true,
+      messages: [{ role: 'system', content: systemPrompt }, ...messages],
     };
 
     try {
@@ -70,61 +70,77 @@ ${productContext ? `LIVE PRODUCT DATA FROM OUR DATABASE:\n${productContext}\n\nI
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(90_000), // 90 s timeout for larger models
+        signal: AbortSignal.timeout(120_000),
       });
 
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Ollama returned ${response.status}: ${errText}`);
+      if (!response.ok || !response.body) {
+        throw new Error(`Ollama ${response.status}: ${await response.text()}`);
       }
 
-      const data = (await response.json()) as {
-        message?: { content?: string };
-        error?: string;
-      };
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullText = '';
+      let buffer = '';
 
-      if (data.error) throw new Error(`Ollama error: ${data.error}`);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      return data.message?.content?.trim() || 'I am here to help!';
+        buffer += decoder.decode(value, { stream: true });
+        // Ollama streams NDJSON — one JSON object per line
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? ''; // keep incomplete last line
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const data = JSON.parse(line) as {
+              message?: { content?: string };
+              done?: boolean;
+              error?: string;
+            };
+            if (data.error) throw new Error(data.error);
+            const chunk = data.message?.content ?? '';
+            if (chunk) {
+              fullText += chunk;
+              onChunk(chunk);
+            }
+          } catch {
+            // skip malformed JSON lines
+          }
+        }
+      }
+
+      return fullText.trim() || 'I am here to help!';
     } catch (err: any) {
-      this.logger.error(`Ollama chat failed: ${err.message}`);
-      return `I'm having trouble responding right now. Please click "Talk to operator" to reach our support team.`;
+      this.logger.error(`Ollama stream failed: ${err.message}`);
+      const fallback = `I'm having trouble responding right now. Please click "Talk to operator" to reach our support team.`;
+      onChunk(fallback);
+      return fallback;
     }
   }
 
   /**
-   * Chat with product search — searches the DB first, then injects results as context.
+   * Search products DB → inject context → stream reply.
    */
-  async chatWithProductContext(
+  async chatWithProductContextStream(
     userMessage: string,
     history: OllamaMessage[],
-    topic?: string,
+    topic: string | undefined,
+    onChunk: (chunk: string) => void,
   ): Promise<string> {
-    // Search products relevant to the user's message
+    // Limit to 5 products to keep the prompt compact → faster generation
     const products = await this.productsService.searchProducts(userMessage);
-    const productContext = this.productsService.formatProductsForPrompt(products);
+    const topProducts = products.slice(0, 5);
+    const productContext = this.productsService.formatProductsForPrompt(topProducts);
 
     const systemPrompt = this.buildSystemPrompt(topic, productContext);
-
-    // Build full message list: history + current user message
     const messages: OllamaMessage[] = [
       ...history,
       { role: 'user', content: userMessage },
     ];
 
-    this.logger.debug(`Product search for "${userMessage}" found ${products.length} results`);
-
-    return this.chat(messages, systemPrompt);
-  }
-
-  async getGreeting(clientName?: string, topic?: string): Promise<string> {
-    const userMessages: OllamaMessage[] = [
-      {
-        role: 'user',
-        content: `Hello${clientName ? `, I'm ${clientName}` : ''}. I need help${topic ? ` with: ${topic}` : ''}.`,
-      },
-    ];
-    // Greeting — no product search needed yet, just a warm welcome
-    return this.chat(userMessages, this.buildSystemPrompt(topic));
+    this.logger.debug(`Product search for "${userMessage}" → ${topProducts.length} results — streaming reply`);
+    return this.chatStream(messages, systemPrompt, onChunk);
   }
 }

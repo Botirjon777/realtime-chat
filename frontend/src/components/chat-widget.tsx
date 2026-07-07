@@ -10,18 +10,13 @@ import { Select } from "./ui/select";
 import { Checkbox } from "./ui/checkbox";
 import { API_BASE_URL } from "@/config/api";
 
-// Speed: characters revealed per tick (higher = faster)
-const TYPING_SPEED_MS = 12;
-const CHARS_PER_TICK = 4;
-
 /**
  * Renders bot message text with basic markdown:
  * - **text** → <strong>
  * - \n → line break
  */
 function renderBotText(text: string) {
-  return text.split('\n').map((line, lineIdx) => {
-    // Split on **bold** tokens
+  return text.split('\n').map((line, lineIdx, arr) => {
     const parts = line.split(/\*\*(.*?)\*\*/g);
     return (
       <span key={lineIdx}>
@@ -32,7 +27,7 @@ function renderBotText(text: string) {
             <span key={i}>{part}</span>
           )
         )}
-        {lineIdx < text.split('\n').length - 1 && <br />}
+        {lineIdx < arr.length - 1 && <br />}
       </span>
     );
   });
@@ -45,6 +40,12 @@ interface ChatMessage {
   createdAt?: string;
 }
 
+// Live streaming message (not yet saved to DB)
+interface StreamingMsg {
+  tempId: number;
+  content: string;
+}
+
 export default function ChatWidget() {
   const [isOpen, setIsOpen] = useState(false);
   const [clientId, setClientId] = useState<string>("");
@@ -54,23 +55,17 @@ export default function ChatWidget() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [showFeedback, setShowFeedback] = useState(false);
   const [step, setStep] = useState<"form" | "chat">("form");
-  const [clientInfo, setClientInfo] = useState({
-    name: "",
-    contact: "",
-    topic: "General",
-  });
+  const [clientInfo, setClientInfo] = useState({ name: "", contact: "", topic: "General" });
   const [rating, setRating] = useState(0);
   const [isResolved, setIsResolved] = useState(false);
   const [comment, setComment] = useState("");
   const [requestingOperator, setRequestingOperator] = useState(false);
 
-  // ── Typing indicator (bot is thinking) ──────────────────────────────────────
+  // ── Streaming state ──────────────────────────────────────────────────────────
+  // streamingMsg: the live bot message bubble being built chunk-by-chunk
+  const [streamingMsg, setStreamingMsg] = useState<StreamingMsg | null>(null);
+  // botIsTyping: three-dot indicator shown while waiting for the FIRST chunk
   const [botIsTyping, setBotIsTyping] = useState(false);
-
-  // ── Text animation state ─────────────────────────────────────────────────────
-  // animating: { id of message being animated, how many chars are revealed }
-  const [animating, setAnimating] = useState<{ id: number; revealed: number } | null>(null);
-  const animTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -85,35 +80,12 @@ export default function ChatWidget() {
     }
   }, []);
 
-  // Auto-scroll whenever messages change or animation progresses
+  // Auto-scroll
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, botIsTyping, animating]);
-
-  // ── Text animation ticker ────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!animating) return;
-
-    const msg = messages.find((m) => m.id === animating.id);
-    if (!msg) { setAnimating(null); return; }
-
-    if (animating.revealed >= msg.content.length) {
-      setAnimating(null);
-      return;
-    }
-
-    animTimerRef.current = setTimeout(() => {
-      setAnimating((prev) =>
-        prev ? { ...prev, revealed: Math.min(prev.revealed + CHARS_PER_TICK, msg.content.length) } : null
-      );
-    }, TYPING_SPEED_MS);
-
-    return () => {
-      if (animTimerRef.current) clearTimeout(animTimerRef.current);
-    };
-  }, [animating, messages]);
+  }, [messages, streamingMsg, botIsTyping]);
 
   // ── Socket events ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -125,13 +97,36 @@ export default function ChatWidget() {
       setStep("chat");
     });
 
+    // Regular messages (client, operator, or the welcome bot message)
     socket.on("message:receive", (msg: ChatMessage) => {
       setBotIsTyping(false);
       setMessages((prev) => [...prev, msg]);
-      // Trigger animation only for bot messages
-      if (msg.senderType === "bot") {
-        setAnimating({ id: msg.id, revealed: 0 });
+    });
+
+    // Bot is about to start streaming → show three-dot indicator
+    socket.on("bot:stream_start", () => {
+      setBotIsTyping(true);
+      setStreamingMsg(null);
+    });
+
+    // A chunk of the bot reply arrived → hide dots, grow the streaming bubble
+    socket.on("bot:chunk", ({ tempId, chunk }: { tempId: number; chunk: string }) => {
+      setBotIsTyping(false); // hide dots as soon as first chunk lands
+      setStreamingMsg((prev) =>
+        prev
+          ? { ...prev, content: prev.content + chunk }
+          : { tempId, content: chunk }
+      );
+      // Scroll after each chunk
+      if (scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
       }
+    });
+
+    // Streaming done → replace live bubble with the persisted DB message
+    socket.on("bot:stream_done", ({ message: savedMsg }: { message: ChatMessage }) => {
+      setStreamingMsg(null);
+      setMessages((prev) => [...prev, savedMsg]);
     });
 
     socket.on("bot:typing", () => {
@@ -142,6 +137,7 @@ export default function ChatWidget() {
       if (room && data.roomId === room.id && data.status === "closed") {
         setShowFeedback(true);
         setBotIsTyping(false);
+        setStreamingMsg(null);
       }
     });
 
@@ -151,6 +147,7 @@ export default function ChatWidget() {
         if (updatedRoom.operatorId) {
           setRequestingOperator(false);
           setBotIsTyping(false);
+          setStreamingMsg(null);
         }
       }
     });
@@ -158,6 +155,9 @@ export default function ChatWidget() {
     return () => {
       socket.off("room:created");
       socket.off("message:receive");
+      socket.off("bot:stream_start");
+      socket.off("bot:chunk");
+      socket.off("bot:stream_done");
       socket.off("bot:typing");
       socket.off("room:status");
       socket.off("room:updated");
@@ -194,6 +194,7 @@ export default function ChatWidget() {
     if (!room) return;
     setRequestingOperator(true);
     setBotIsTyping(false);
+    setStreamingMsg(null);
     socket?.emit("room:request_operator", { roomId: room.id });
   };
 
@@ -207,21 +208,9 @@ export default function ChatWidget() {
     setComment("");
     setRequestingOperator(false);
     setBotIsTyping(false);
-    setAnimating(null);
+    setStreamingMsg(null);
   };
 
-  // Resolved display text for animated messages
-  const getDisplayContent = (msg: ChatMessage) => {
-    if (animating?.id === msg.id) {
-      return msg.content.substring(0, animating.revealed);
-    }
-    return msg.content;
-  };
-
-  const isCursorVisible = (msg: ChatMessage) =>
-    animating?.id === msg.id && animating.revealed < msg.content.length;
-
-  // Header label
   const headerStatus = () => {
     if (!room) return "Online Support";
     if (room.operatorId) return "Operator Connected";
@@ -240,16 +229,14 @@ export default function ChatWidget() {
       isOpen ? "max-sm:inset-0 sm:bottom-6 sm:right-6" : "bottom-6 right-6"
     }`}>
       {!isOpen ? (
-        <button
-          onClick={initChat}
-          className="w-14 h-14 bg-blue-600 rounded-full flex items-center justify-center text-white shadow-xl hover:bg-blue-500 transition-all hover:scale-110 active:scale-95"
-        >
+        <button onClick={initChat}
+          className="w-14 h-14 bg-blue-600 rounded-full flex items-center justify-center text-white shadow-xl hover:bg-blue-500 transition-all hover:scale-110 active:scale-95">
           <MessageCircle size={28} />
         </button>
       ) : (
         <div className="bg-white shadow-2xl flex flex-col overflow-hidden border border-slate-200 animate-in slide-in-from-bottom-4 duration-300
           max-sm:w-full max-sm:h-full max-sm:rounded-none
-          sm:w-[400px] sm:h-[650px] sm:rounded-2xl font-sans">
+          sm:w-[400px] sm:h-[650px] sm:rounded-2xl">
 
           {/* Header */}
           <div className="bg-blue-600 p-4 text-white flex items-center justify-between">
@@ -292,13 +279,13 @@ export default function ChatWidget() {
                 </div>
                 <div className="space-y-4">
                   <Input label="Full Name" required value={clientInfo.name}
-                    onChange={(e) => setClientInfo((prev) => ({ ...prev, name: e.target.value }))}
+                    onChange={(e) => setClientInfo((p) => ({ ...p, name: e.target.value }))}
                     placeholder="Enter your name" />
                   <Input label="Email or Phone" required value={clientInfo.contact}
-                    onChange={(e) => setClientInfo((prev) => ({ ...prev, contact: e.target.value }))}
+                    onChange={(e) => setClientInfo((p) => ({ ...p, contact: e.target.value }))}
                     placeholder="e.g. john@example.com" />
                   <Select label="What is your problem?" value={clientInfo.topic}
-                    onChange={(val) => setClientInfo((prev) => ({ ...prev, topic: val }))}
+                    onChange={(val) => setClientInfo((p) => ({ ...p, topic: val }))}
                     options={[
                       { label: "General Support", value: "General Support" },
                       { label: "Technical Issue", value: "Technical Issue" },
@@ -323,13 +310,10 @@ export default function ChatWidget() {
                   </div>
                 )}
 
-                {/* Messages */}
+                {/* Persisted messages */}
                 {messages.map((msg) => {
                   const isClient = msg.senderType === "client";
                   const isBot = msg.senderType === "bot";
-                  const displayContent = getDisplayContent(msg);
-                  const showCursor = isCursorVisible(msg);
-
                   return (
                     <div key={msg.id} className={`flex ${isClient ? "justify-end" : "justify-start"} items-end gap-2`}>
                       {isBot && (
@@ -349,25 +333,35 @@ export default function ChatWidget() {
                             Mainframe AI
                           </span>
                         )}
-                        {isBot ? (
-                          <span className="whitespace-pre-wrap break-words leading-relaxed">
-                            {renderBotText(displayContent)}
-                            {showCursor && (
-                              <span className="inline-block w-[2px] h-[14px] bg-violet-400 ml-[1px] align-middle animate-pulse" />
-                            )}
-                          </span>
-                        ) : (
-                          <span className="whitespace-pre-wrap break-words">
-                            {displayContent}
-                          </span>
-                        )}
+                        <span className="whitespace-pre-wrap break-words leading-relaxed">
+                          {isBot ? renderBotText(msg.content) : msg.content}
+                        </span>
                       </div>
                     </div>
                   );
                 })}
 
-                {/* Bot typing indicator (three dots) */}
-                {botIsTyping && (
+                {/* Live streaming bubble — grows as chunks arrive */}
+                {streamingMsg && (
+                  <div className="flex justify-start items-end gap-2">
+                    <div className="w-7 h-7 rounded-full bg-violet-100 flex items-center justify-center shrink-0 mb-1">
+                      <Bot size={14} className="text-violet-600" />
+                    </div>
+                    <div className="max-w-[85%] bg-violet-50 border border-violet-200 rounded-2xl rounded-tl-none p-3 text-sm text-slate-800 shadow-sm">
+                      <span className="block text-[10px] text-violet-500 font-semibold uppercase tracking-wide mb-1">
+                        Mainframe AI
+                      </span>
+                      <span className="whitespace-pre-wrap break-words leading-relaxed">
+                        {renderBotText(streamingMsg.content)}
+                        {/* blinking cursor while streaming */}
+                        <span className="inline-block w-[2px] h-[14px] bg-violet-400 ml-[1px] align-middle animate-pulse" />
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Three-dot indicator — shown only until first chunk lands */}
+                {botIsTyping && !streamingMsg && (
                   <div className="flex justify-start items-end gap-2">
                     <div className="w-7 h-7 rounded-full bg-violet-100 flex items-center justify-center shrink-0">
                       <Bot size={14} className="text-violet-600" />
@@ -398,14 +392,10 @@ export default function ChatWidget() {
               <div className="p-4 flex gap-2 items-center">
                 {step === "chat" ? (
                   <>
-                    <Input
-                      value={message}
-                      onChange={(e) => setMessage(e.target.value)}
+                    <Input value={message} onChange={(e) => setMessage(e.target.value)}
                       onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                      placeholder="Write a message…"
-                      className="flex-1 h-10 rounded-full"
-                    />
-                    <Button onClick={sendMessage} disabled={!isConnected} size="icon" className="rounded-full shrink-0">
+                      placeholder="Write a message…" className="flex-1 h-10 rounded-full" />
+                    <Button onClick={sendMessage} disabled={!isConnected || !!streamingMsg} size="icon" className="rounded-full shrink-0">
                       <Send size={16} />
                     </Button>
                   </>
