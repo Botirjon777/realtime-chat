@@ -111,26 +111,21 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client.emit('room:created', room);
     this.server.emit('room:waiting', room); // Notify operators panel
 
-    // ── AI greeting ──────────────────────────────────────────────────────────
-    // Build conversation history for Ollama
-    const history: OllamaMessage[] = [];
-    if (data.message) {
-      history.push({ role: 'user', content: data.message });
-    }
-
-    const greetingText = await this.ollamaService.getGreeting(
-      data.clientName,
-      data.topic,
-    );
+    // ── Fixed welcome message (instant, no Ollama call) ───────────────────────
+    const name = data.clientName ? data.clientName.split(' ')[0] : 'there';
+    const welcomeText =
+      `Hello ${name}! 👋 Welcome to **MAINFrame Custom Cables Store**! ` +
+      `I'm Mainframe AI, your personal cable expert. ` +
+      `How can I help you today? Feel free to ask about our cables, products, pricing, or availability!`;
 
     const botGreeting = await this.chatService.saveMessage(
       room.id,
       SenderType.BOT,
       'ai-bot',
-      greetingText,
+      welcomeText,
     );
     this.server.to(room.id).emit('message:receive', botGreeting);
-    // ─────────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────────────
   }
 
   @SubscribeMessage('operator:identify')
@@ -227,6 +222,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
             role: (m.senderType === SenderType.CLIENT ? 'user' : 'assistant') as 'user' | 'assistant',
             content: m.content,
           }));
+
+        // Signal frontend that bot is composing a reply
+        this.server.to(data.roomId).emit('bot:typing', { roomId: data.roomId });
 
         // Search products DB + inject as context → Ollama reply
         const aiReply = await this.ollamaService.chatWithProductContext(
