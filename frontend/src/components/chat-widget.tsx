@@ -14,6 +14,30 @@ import { API_BASE_URL } from "@/config/api";
 const TYPING_SPEED_MS = 12;
 const CHARS_PER_TICK = 4;
 
+/**
+ * Renders bot message text with basic markdown:
+ * - **text** → <strong>
+ * - \n → line break
+ */
+function renderBotText(text: string) {
+  return text.split('\n').map((line, lineIdx) => {
+    // Split on **bold** tokens
+    const parts = line.split(/\*\*(.*?)\*\*/g);
+    return (
+      <span key={lineIdx}>
+        {parts.map((part, i) =>
+          i % 2 === 1 ? (
+            <strong key={i} className="font-semibold text-violet-800">{part}</strong>
+          ) : (
+            <span key={i}>{part}</span>
+          )
+        )}
+        {lineIdx < text.split('\n').length - 1 && <br />}
+      </span>
+    );
+  });
+}
+
 interface ChatMessage {
   id: number;
   senderType: string;
@@ -325,12 +349,18 @@ export default function ChatWidget() {
                             Mainframe AI
                           </span>
                         )}
-                        <span className="whitespace-pre-wrap break-words">
-                          {displayContent}
-                          {showCursor && (
-                            <span className="inline-block w-[2px] h-[14px] bg-violet-400 ml-[1px] align-middle animate-pulse" />
-                          )}
-                        </span>
+                        {isBot ? (
+                          <span className="whitespace-pre-wrap break-words leading-relaxed">
+                            {renderBotText(displayContent)}
+                            {showCursor && (
+                              <span className="inline-block w-[2px] h-[14px] bg-violet-400 ml-[1px] align-middle animate-pulse" />
+                            )}
+                          </span>
+                        ) : (
+                          <span className="whitespace-pre-wrap break-words">
+                            {displayContent}
+                          </span>
+                        )}
                       </div>
                     </div>
                   );

@@ -113,10 +113,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // ── Fixed welcome message (instant, no Ollama call) ───────────────────────
     const name = data.clientName ? data.clientName.split(' ')[0] : 'there';
-    const welcomeText =
-      `Hello ${name}! 👋 Welcome to **MAINFrame Custom Cables Store**! ` +
-      `I'm Mainframe AI, your personal cable expert. ` +
-      `How can I help you today? Feel free to ask about our cables, products, pricing, or availability!`;
+    const welcomeText = [
+      `👋 Hello ${name}! Welcome to **MAINFrame Custom Cables Store**!`,
+      `I'm **Mainframe AI** — your personal cable expert. I can help you discover the perfect cables, sleeving, connectors, and PC modding accessories from our catalog.`,
+      `How can I help you today?`,
+    ].join('\n\n');
 
     const botGreeting = await this.chatService.saveMessage(
       room.id,
