@@ -5,6 +5,7 @@ export enum SenderType {
   CLIENT = 'client',
   OPERATOR = 'operator',
   ADMIN = 'admin',
+  BOT = 'bot',
 }
 
 @Entity('messages')

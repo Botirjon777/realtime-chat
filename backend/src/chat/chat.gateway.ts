@@ -14,6 +14,7 @@ import { UsersService } from '../users/users.service';
 import { SenderType } from './entities/message.entity';
 import { RoomStatus } from './entities/room.entity';
 import { UserRole, UserStatus } from '../users/entities/user.entity';
+import { OllamaService, OllamaMessage } from '../ollama/ollama.service';
 
 @WebSocketGateway({
   cors: {
@@ -28,6 +29,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly chatService: ChatService,
     private readonly redisService: RedisService,
     private readonly usersService: UsersService,
+    private readonly ollamaService: OllamaService,
   ) {}
 
   async handleConnection(client: Socket) {
@@ -43,18 +45,18 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
 
     const clientId = client.data.clientId;
-    
+
     // Notify rooms about disconnection and close them if it's a client
     const rooms = Array.from(client.rooms);
     for (const roomId of rooms) {
       if (roomId !== client.id) {
         this.server.to(roomId).emit('user:left', { userId: client.id, roomId });
-        
+
         // If it's the client of this room, mark it as closed
         if (clientId) {
           await this.chatService.updateRoomStatus(roomId, RoomStatus.CLOSED);
           this.server.to(roomId).emit('room:status', { roomId, status: RoomStatus.CLOSED });
-          
+
           const room = await this.chatService.findRoom(roomId);
           this.server.to(roomId).emit('room:updated', room);
         }
@@ -74,8 +76,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('room:init')
   async handleRoomInit(
-    @MessageBody() data: { 
-      clientId: string; 
+    @MessageBody() data: {
+      clientId: string;
       message?: string;
       clientName?: string;
       clientContact?: string;
@@ -83,15 +85,16 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     },
     @ConnectedSocket() client: Socket,
   ) {
-    client.data.clientId = data.clientId; // Store clientId on socket
+    client.data.clientId = data.clientId;
     const room = await this.chatService.createRoom(
       data.clientId,
       data.clientName,
       data.clientContact,
-      data.topic
+      data.topic,
     );
     client.join(room.id);
-    
+
+    // Save the client's opening message if provided
     if (data.message) {
       const savedMessage = await this.chatService.saveMessage(
         room.id,
@@ -101,9 +104,30 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       );
       room.messages = [savedMessage];
     }
-    
+
     client.emit('room:created', room);
-    this.server.emit('room:waiting', room); // Notify operators
+    this.server.emit('room:waiting', room); // Notify operators panel
+
+    // ── AI greeting ──────────────────────────────────────────────────────────
+    // Build conversation history for Ollama
+    const history: OllamaMessage[] = [];
+    if (data.message) {
+      history.push({ role: 'user', content: data.message });
+    }
+
+    const greetingText = await this.ollamaService.getGreeting(
+      data.clientName,
+      data.topic,
+    );
+
+    const botGreeting = await this.chatService.saveMessage(
+      room.id,
+      SenderType.BOT,
+      'ai-bot',
+      greetingText,
+    );
+    this.server.to(room.id).emit('message:receive', botGreeting);
+    // ─────────────────────────────────────────────────────────────────────────
   }
 
   @SubscribeMessage('operator:identify')
@@ -124,14 +148,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     const operatorId = client.data.operatorId;
     const room = await this.chatService.findRoom(data.roomId);
-    
+
     if (room && room.status === RoomStatus.WAITING && operatorId) {
       await this.chatService.assignRoom(data.roomId, operatorId);
       const updatedRoom = await this.chatService.findRoom(data.roomId);
       this.server.to(data.roomId).emit('room:updated', updatedRoom);
       this.server.emit('room:assigned', { roomId: data.roomId, operatorId });
     }
-    
+
     this.server.to(data.roomId).emit('user:joined', { userId: client.id, roomId: data.roomId });
     client.join(data.roomId);
   }
@@ -142,7 +166,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     await this.chatService.updateRoomStatus(data.roomId, RoomStatus.CLOSED);
     this.server.to(data.roomId).emit('room:status', { roomId: data.roomId, status: RoomStatus.CLOSED });
-    
+
     const room = await this.chatService.findRoom(data.roomId);
     this.server.to(data.roomId).emit('room:updated', room);
   }
@@ -170,6 +194,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return; // Reject messages to closed rooms
     }
 
+    // Save the client's message
     const message = await this.chatService.saveMessage(
       data.roomId,
       data.senderType,
@@ -177,8 +202,76 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       data.content,
     );
     this.server.to(data.roomId).emit('message:receive', message);
-    this.server.emit('message:global_signal', { roomId: data.roomId }); // For global analytics
+    this.server.emit('message:global_signal', { roomId: data.roomId });
+
+    // ── AI auto-reply ─────────────────────────────────────────────────────────
+    // Route to Ollama only when:
+    //   1. Sender is client
+    //   2. No human operator has joined
+    //   3. Client has NOT requested a human operator
+    const isClientMessage = data.senderType === SenderType.CLIENT;
+    const noOperator = !room.operatorId;
+    const notEscalated = !room.requestedOperator;
+
+    if (isClientMessage && noOperator && notEscalated) {
+      // Build conversation history from room messages (latest 10 pairs for context)
+      const allMessages = room.messages || [];
+      const history: OllamaMessage[] = allMessages
+        .slice(-10)
+        .filter((m) => m.senderType === SenderType.CLIENT || m.senderType === SenderType.BOT)
+        .map((m) => ({
+          role: m.senderType === SenderType.CLIENT ? 'user' : 'assistant',
+          content: m.content,
+        }));
+
+      // Append the latest message (already saved above) to history
+      history.push({ role: 'user', content: data.content });
+
+      const systemPrompt = this.ollamaService.buildSystemPrompt(room.topic);
+      const aiReply = await this.ollamaService.chat(history, systemPrompt);
+
+      const botMessage = await this.chatService.saveMessage(
+        data.roomId,
+        SenderType.BOT,
+        'ai-bot',
+        aiReply,
+      );
+      this.server.to(data.roomId).emit('message:receive', botMessage);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
   }
+
+  // ── New: Client requests a human operator ──────────────────────────────────
+  @SubscribeMessage('room:request_operator')
+  async handleRequestOperator(
+    @MessageBody() data: { roomId: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const room = await this.chatService.findRoom(data.roomId);
+    if (!room || room.status === RoomStatus.CLOSED) return;
+
+    // Mark room as requesting a human
+    await this.chatService.setRequestedOperator(data.roomId);
+
+    // Bot sends a handoff message
+    const handoffText =
+      "You've requested a human operator. Please hold on — someone from our support team will be with you shortly. 🙌";
+    const handoffMsg = await this.chatService.saveMessage(
+      data.roomId,
+      SenderType.BOT,
+      'ai-bot',
+      handoffText,
+    );
+    this.server.to(data.roomId).emit('message:receive', handoffMsg);
+
+    // Re-fetch the updated room and broadcast
+    const updatedRoom = await this.chatService.findRoom(data.roomId);
+    this.server.to(data.roomId).emit('room:updated', updatedRoom);
+
+    // Notify operators panel (room already has status=waiting, just refresh)
+    this.server.emit('room:waiting', updatedRoom);
+  }
+  // ──────────────────────────────────────────────────────────────────────────
 
   @SubscribeMessage('user:typing')
   handleTyping(

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { useSocket } from "@/hooks/use-socket";
-import { Send, MessageCircle, X, Minus, Star } from "lucide-react";
+import { Send, MessageCircle, X, Star, UserCheck, Loader2, Bot } from "lucide-react";
 import { v4 as uuidv4 } from "uuid";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -27,6 +27,7 @@ export default function ChatWidget() {
   const [rating, setRating] = useState(0);
   const [isResolved, setIsResolved] = useState(false);
   const [comment, setComment] = useState("");
+  const [requestingOperator, setRequestingOperator] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -79,6 +80,10 @@ export default function ChatWidget() {
     socket.on("room:updated", (updatedRoom) => {
       if (room && updatedRoom.id === room.id) {
         setRoom(updatedRoom);
+        // If operator has now joined, clear the "requesting operator" state
+        if (updatedRoom.operatorId) {
+          setRequestingOperator(false);
+        }
       }
     });
 
@@ -126,6 +131,12 @@ export default function ChatWidget() {
     setMessage("");
   };
 
+  const requestOperator = () => {
+    if (!room) return;
+    setRequestingOperator(true);
+    socket?.emit("room:request_operator", { roomId: room.id });
+  };
+
   const submitFeedback = () => {
     socket?.emit("feedback:submit", {
       roomId: room.id,
@@ -139,6 +150,21 @@ export default function ChatWidget() {
     setMessages([]);
     setRating(0);
     setComment("");
+    setRequestingOperator(false);
+  };
+
+  // Determine header status label
+  const headerStatus = () => {
+    if (!room) return "Online Support";
+    if (room.operatorId) return "Operator Connected";
+    if (room.requestedOperator || requestingOperator) return "Connecting to operator…";
+    return "AI Assistant";
+  };
+
+  const headerDotColor = () => {
+    if (room?.operatorId) return "bg-emerald-400";
+    if (room?.requestedOperator || requestingOperator) return "bg-amber-400 animate-pulse";
+    return "bg-violet-400 animate-pulse";
   };
 
   return (
@@ -159,8 +185,8 @@ export default function ChatWidget() {
           {/* Header */}
           <div className="bg-blue-600 p-4 text-white flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-              <span className="font-semibold text-sm">Online Support</span>
+              <div className={`w-2 h-2 rounded-full ${headerDotColor()}`} />
+              <span className="font-semibold text-sm">{headerStatus()}</span>
             </div>
             <div className="flex gap-2">
               <button
@@ -178,7 +204,6 @@ export default function ChatWidget() {
             className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50"
           >
             {showFeedback ? (
-              // ... existing feedback UI
               <div className="flex flex-col items-center justify-center h-full text-center space-y-4">
                 <h3 className="font-bold text-slate-800">Support Chat Ended</h3>
                 <p className="text-xs text-slate-500">
@@ -214,7 +239,7 @@ export default function ChatWidget() {
                   className="w-full mt-4"
                   size="lg"
                 >
-                  Submit & Close
+                  Submit &amp; Close
                 </Button>
               </div>
             ) : step === "form" && !room ? (
@@ -279,71 +304,127 @@ export default function ChatWidget() {
               </form>
             ) : (
               <>
+                {/* Bot / operator status banner when no messages yet */}
                 {messages.length === 0 && (
                   <div className="text-center text-slate-400 mt-10">
                     <p className="text-sm">
                       {room?.operatorId
                         ? "Operator connected!"
-                        : "Connecting you to an operator..."}
+                        : "AI assistant is ready to help…"}
                     </p>
                     <p className="text-[10px] uppercase font-bold tracking-widest mt-2">
                       {clientInfo.topic}
                     </p>
                   </div>
                 )}
-                {messages.map((msg, idx) => (
-                  <div
-                    key={idx}
-                    className={`flex ${msg.senderType === "client" ? "justify-end" : "justify-start"}`}
-                  >
-                    <div
-                      className={`max-w-[85%] p-3 rounded-2xl text-sm shadow-sm ${
-                        msg.senderType === "client"
-                          ? "bg-blue-600 text-white rounded-tr-none"
-                          : "bg-white text-slate-800 rounded-tl-none border border-slate-200"
-                      }`}
-                    >
-                      {msg.content}
-                    </div>
+
+                {/* Waiting-for-operator banner */}
+                {(room?.requestedOperator || requestingOperator) && !room?.operatorId && (
+                  <div className="flex items-center gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 text-amber-700 text-xs font-medium">
+                    <Loader2 size={14} className="animate-spin shrink-0" />
+                    <span>Waiting for a human operator to join…</span>
                   </div>
-                ))}
+                )}
+
+                {/* Operator joined banner */}
+                {room?.operatorId && (
+                  <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2 text-emerald-700 text-xs font-medium">
+                    <UserCheck size={14} className="shrink-0" />
+                    <span>A support operator has joined the chat.</span>
+                  </div>
+                )}
+
+                {/* Messages */}
+                {messages.map((msg, idx) => {
+                  const isClient = msg.senderType === "client";
+                  const isBot = msg.senderType === "bot";
+
+                  return (
+                    <div
+                      key={idx}
+                      className={`flex ${isClient ? "justify-end" : "justify-start"} items-end gap-2`}
+                    >
+                      {/* Bot avatar */}
+                      {isBot && (
+                        <div className="w-7 h-7 rounded-full bg-violet-100 flex items-center justify-center shrink-0 mb-1">
+                          <Bot size={14} className="text-violet-600" />
+                        </div>
+                      )}
+                      <div
+                        className={`max-w-[85%] p-3 rounded-2xl text-sm shadow-sm ${
+                          isClient
+                            ? "bg-blue-600 text-white rounded-tr-none"
+                            : isBot
+                            ? "bg-violet-50 text-slate-800 rounded-tl-none border border-violet-200"
+                            : "bg-white text-slate-800 rounded-tl-none border border-slate-200"
+                        }`}
+                      >
+                        {isBot && (
+                          <span className="block text-[10px] text-violet-500 font-semibold uppercase tracking-wide mb-1">
+                            AI Assistant
+                          </span>
+                        )}
+                        {msg.content}
+                      </div>
+                    </div>
+                  );
+                })}
               </>
             )}
           </div>
 
-          {/* Input */}
+          {/* Input Footer */}
           {!showFeedback && (
-            <div className="p-4 bg-white border-t border-slate-100 flex gap-2 items-center">
-              {step === "chat" ? (
-                <>
-                  <Input
-                    value={message}
-                    onChange={(e) => setMessage(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                    placeholder="Write a message..."
-                    className="flex-1 h-10 rounded-full"
-                  />
+            <div className="bg-white border-t border-slate-100">
+              {/* "Talk to operator" button — shown only when chatting with bot and not yet escalated */}
+              {step === "chat" &&
+                room &&
+                !room.operatorId &&
+                !room.requestedOperator &&
+                !requestingOperator && (
+                  <div className="px-4 pt-3">
+                    <button
+                      onClick={requestOperator}
+                      className="w-full flex items-center justify-center gap-2 text-xs text-slate-500 hover:text-blue-600 hover:bg-blue-50 border border-slate-200 hover:border-blue-200 rounded-lg py-2 px-3 transition-all"
+                    >
+                      <UserCheck size={13} />
+                      Talk to a human operator
+                    </button>
+                  </div>
+                )}
+
+              <div className="p-4 flex gap-2 items-center">
+                {step === "chat" ? (
+                  <>
+                    <Input
+                      value={message}
+                      onChange={(e) => setMessage(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                      placeholder="Write a message…"
+                      className="flex-1 h-10 rounded-full"
+                    />
+                    <Button
+                      onClick={sendMessage}
+                      disabled={!isConnected}
+                      size="icon"
+                      className="rounded-full shrink-0"
+                    >
+                      <Send size={16} />
+                    </Button>
+                  </>
+                ) : (
                   <Button
-                    onClick={sendMessage}
+                    type="submit"
+                    form="chat-init-form"
                     disabled={!isConnected}
-                    size="icon"
-                    className="rounded-full shrink-0"
+                    className="w-full"
+                    size="lg"
+                    isLoading={!isConnected && step === "form"}
                   >
-                    <Send size={16} />
+                    Start Chatting
                   </Button>
-                </>
-              ) : (
-                <Button
-                  type="submit"
-                  form="chat-init-form"
-                  disabled={!isConnected}
-                  className="w-full"
-                  size="lg"
-                  isLoading={!isConnected && step === "form"}
-                >
-                  Start Chatting
-                </Button>
-              )}
+                )}
+              </div>
             </div>
           )}
         </div>

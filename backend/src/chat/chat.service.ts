@@ -79,6 +79,10 @@ export class ChatService {
     });
   }
 
+  async setRequestedOperator(roomId: string): Promise<void> {
+    await this.roomRepository.update(roomId, { requestedOperator: true } as any);
+  }
+
   async getWaitingRooms(): Promise<Room[]> {
     return this.roomRepository.find({
       where: { status: RoomStatus.WAITING },

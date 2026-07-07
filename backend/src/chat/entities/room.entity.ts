@@ -42,4 +42,7 @@ export class Room {
 
   @Column({ nullable: true })
   closedAt: Date;
+
+  @Column({ default: false })
+  requestedOperator: boolean;
 }
