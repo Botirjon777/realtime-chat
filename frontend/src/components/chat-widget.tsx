@@ -61,6 +61,18 @@ export default function ChatWidget() {
   const [comment, setComment] = useState("");
   const [requestingOperator, setRequestingOperator] = useState(false);
 
+  // ── Block background scroll when widget is open ──────────────────────────────
+  useEffect(() => {
+    if (isOpen) {
+      document.body.classList.add("overflow-hidden");
+    } else {
+      document.body.classList.remove("overflow-hidden");
+    }
+    return () => {
+      document.body.classList.remove("overflow-hidden");
+    };
+  }, [isOpen]);
+
   // ── Streaming state ──────────────────────────────────────────────────────────
   // streamingMsg: the live bot message bubble being built chunk-by-chunk
   const [streamingMsg, setStreamingMsg] = useState<StreamingMsg | null>(null);
