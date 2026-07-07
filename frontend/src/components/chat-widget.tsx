@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { useSocket } from "@/hooks/use-socket";
-import { Send, MessageCircle, X, Minus, Star } from "lucide-react";
+import { Send, MessageCircle, X, Star, UserCheck, Loader2, Bot } from "lucide-react";
 import { v4 as uuidv4 } from "uuid";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -10,53 +10,98 @@ import { Select } from "./ui/select";
 import { Checkbox } from "./ui/checkbox";
 import { API_BASE_URL } from "@/config/api";
 
+/**
+ * Renders bot message text with basic markdown:
+ * - **text** → <strong>
+ * - \n → line break
+ */
+function renderBotText(text: string) {
+  return text.split('\n').map((line, lineIdx, arr) => {
+    const parts = line.split(/\*\*(.*?)\*\*/g);
+    return (
+      <span key={lineIdx}>
+        {parts.map((part, i) =>
+          i % 2 === 1 ? (
+            <strong key={i} className="font-semibold text-violet-800">{part}</strong>
+          ) : (
+            <span key={i}>{part}</span>
+          )
+        )}
+        {lineIdx < arr.length - 1 && <br />}
+      </span>
+    );
+  });
+}
+
+interface ChatMessage {
+  id: number;
+  senderType: string;
+  content: string;
+  createdAt?: string;
+}
+
+// Live streaming message (not yet saved to DB)
+interface StreamingMsg {
+  tempId: number;
+  content: string;
+}
+
 export default function ChatWidget() {
   const [isOpen, setIsOpen] = useState(false);
   const [clientId, setClientId] = useState<string>("");
   const [room, setRoom] = useState<any>(null);
   const { socket, isConnected } = useSocket(API_BASE_URL);
   const [message, setMessage] = useState("");
-  const [messages, setMessages] = useState<any[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [showFeedback, setShowFeedback] = useState(false);
   const [step, setStep] = useState<"form" | "chat">("form");
-  const [clientInfo, setClientInfo] = useState({
-    name: "",
-    contact: "",
-    topic: "General",
-  });
+  const [clientInfo, setClientInfo] = useState({ name: "", contact: "", topic: "General" });
   const [rating, setRating] = useState(0);
   const [isResolved, setIsResolved] = useState(false);
   const [comment, setComment] = useState("");
+  const [requestingOperator, setRequestingOperator] = useState(false);
+
+  // ── Block background scroll when widget is open ──────────────────────────────
+  useEffect(() => {
+    if (isOpen) {
+      document.body.classList.add("overflow-hidden");
+    } else {
+      document.body.classList.remove("overflow-hidden");
+    }
+    return () => {
+      document.body.classList.remove("overflow-hidden");
+    };
+  }, [isOpen]);
+
+  // ── Streaming state ──────────────────────────────────────────────────────────
+  // streamingMsg: the live bot message bubble being built chunk-by-chunk
+  const [streamingMsg, setStreamingMsg] = useState<StreamingMsg | null>(null);
+  // botIsTyping: three-dot indicator shown while waiting for the FIRST chunk
+  const [botIsTyping, setBotIsTyping] = useState(false);
+  // currentSteps: list of steps currently executed by the backend
+  const [currentSteps, setCurrentSteps] = useState<{ step: number; text: string }[]>([]);
+
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const id = localStorage.getItem("chat_client_id");
     const savedName = localStorage.getItem("chat_client_name");
     const savedContact = localStorage.getItem("chat_client_contact");
-
-    if (id) {
-      setClientId(id);
-    } else {
-      const newId = uuidv4();
-      localStorage.setItem("chat_client_id", newId);
-      setClientId(newId);
-    }
-
+    if (id) { setClientId(id); }
+    else { const newId = uuidv4(); localStorage.setItem("chat_client_id", newId); setClientId(newId); }
     if (savedName && savedContact) {
-      setClientInfo((prev) => ({
-        ...prev,
-        name: savedName,
-        contact: savedContact,
-      }));
+      setClientInfo((prev) => ({ ...prev, name: savedName, contact: savedContact }));
     }
   }, []);
 
+  // Auto-scroll
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, streamingMsg, botIsTyping]);
 
+  // ── Socket events ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!socket || !clientId) return;
 
@@ -66,41 +111,89 @@ export default function ChatWidget() {
       setStep("chat");
     });
 
-    socket.on("message:receive", (msg) => {
+    // Regular messages (client, operator, or the welcome bot message)
+    socket.on("message:receive", (msg: ChatMessage) => {
+      setBotIsTyping(false);
       setMessages((prev) => [...prev, msg]);
+    });
+
+    // Bot is about to start streaming → show three-dot indicator
+    socket.on("bot:stream_start", () => {
+      setBotIsTyping(true);
+      setStreamingMsg(null);
+      setCurrentSteps([]);
+    });
+
+    socket.on("bot:step", ({ step, text }: { step: number; text: string }) => {
+      setCurrentSteps((prev) => {
+        const filtered = prev.filter((s) => s.step !== step);
+        return [...filtered, { step, text }].sort((a, b) => a.step - b.step);
+      });
+    });
+
+    // A chunk of the bot reply arrived → hide dots, grow the streaming bubble
+    socket.on("bot:chunk", ({ tempId, chunk }: { tempId: number; chunk: string }) => {
+      setBotIsTyping(false); // hide dots as soon as first chunk lands
+      setStreamingMsg((prev) =>
+        prev
+          ? { ...prev, content: prev.content + chunk }
+          : { tempId, content: chunk }
+      );
+      // Scroll after each chunk
+      if (scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      }
+    });
+
+    // Streaming done → replace live bubble with the persisted DB message
+    socket.on("bot:stream_done", ({ message: savedMsg }: { message: ChatMessage }) => {
+      setStreamingMsg(null);
+      setMessages((prev) => [...prev, savedMsg]);
+      setCurrentSteps([]);
+    });
+
+    socket.on("bot:typing", () => {
+      setBotIsTyping(true);
     });
 
     socket.on("room:status", (data) => {
       if (room && data.roomId === room.id && data.status === "closed") {
         setShowFeedback(true);
+        setBotIsTyping(false);
+        setStreamingMsg(null);
       }
     });
 
     socket.on("room:updated", (updatedRoom) => {
       if (room && updatedRoom.id === room.id) {
         setRoom(updatedRoom);
+        if (updatedRoom.operatorId) {
+          setRequestingOperator(false);
+          setBotIsTyping(false);
+          setStreamingMsg(null);
+        }
       }
     });
 
     return () => {
       socket.off("room:created");
       socket.off("message:receive");
+      socket.off("bot:stream_start");
+      socket.off("bot:chunk");
+      socket.off("bot:stream_done");
+      socket.off("bot:typing");
       socket.off("room:status");
       socket.off("room:updated");
     };
   }, [socket, clientId, room]);
 
-  const initChat = () => {
-    setIsOpen(true);
-  };
+  const initChat = () => setIsOpen(true);
 
   const startChat = (e: React.FormEvent) => {
     e.preventDefault();
     if (!clientInfo.name || !clientInfo.contact) return;
-
     localStorage.setItem("chat_client_name", clientInfo.name);
     localStorage.setItem("chat_client_contact", clientInfo.contact);
-
     socket?.emit("room:init", {
       clientId,
       clientName: clientInfo.name,
@@ -110,13 +203,7 @@ export default function ChatWidget() {
   };
 
   const sendMessage = () => {
-    if (!message.trim()) return;
-
-    if (!room) {
-      alert("Please use the form to start a chat");
-      return;
-    }
-
+    if (!message.trim() || !room) return;
     socket?.emit("message:send", {
       roomId: room.id,
       senderId: clientId,
@@ -126,19 +213,38 @@ export default function ChatWidget() {
     setMessage("");
   };
 
+  const requestOperator = () => {
+    if (!room) return;
+    setRequestingOperator(true);
+    setBotIsTyping(false);
+    setStreamingMsg(null);
+    socket?.emit("room:request_operator", { roomId: room.id });
+  };
+
   const submitFeedback = () => {
-    socket?.emit("feedback:submit", {
-      roomId: room.id,
-      rating,
-      isResolved,
-      comment,
-    });
+    socket?.emit("feedback:submit", { roomId: room.id, rating, isResolved, comment });
     setShowFeedback(false);
     setRoom(null);
     setStep("form");
     setMessages([]);
     setRating(0);
     setComment("");
+    setRequestingOperator(false);
+    setBotIsTyping(false);
+    setStreamingMsg(null);
+  };
+
+  const headerStatus = () => {
+    if (!room) return "Online Support";
+    if (room.operatorId) return "Operator Connected";
+    if (room.requestedOperator || requestingOperator) return "Connecting to operator…";
+    return "Mainframe AI";
+  };
+
+  const headerDotColor = () => {
+    if (room?.operatorId) return "bg-emerald-400";
+    if (room?.requestedOperator || requestingOperator) return "bg-amber-400 animate-pulse";
+    return "bg-violet-400 animate-pulse";
   };
 
   return (
@@ -146,204 +252,193 @@ export default function ChatWidget() {
       isOpen ? "max-sm:inset-0 sm:bottom-6 sm:right-6" : "bottom-6 right-6"
     }`}>
       {!isOpen ? (
-        <button
-          onClick={initChat}
-          className="w-14 h-14 bg-blue-600 rounded-full flex items-center justify-center text-white shadow-xl hover:bg-blue-500 transition-all hover:scale-110 active:scale-95"
-        >
+        <button onClick={initChat}
+          className="w-14 h-14 bg-blue-600 rounded-full flex items-center justify-center text-white shadow-xl hover:bg-blue-500 transition-all hover:scale-110 active:scale-95">
           <MessageCircle size={28} />
         </button>
       ) : (
         <div className="bg-white shadow-2xl flex flex-col overflow-hidden border border-slate-200 animate-in slide-in-from-bottom-4 duration-300
           max-sm:w-full max-sm:h-full max-sm:rounded-none
-          sm:w-[400px] sm:h-[650px] sm:rounded-2xl font-sans">
+          sm:w-[400px] sm:h-[650px] sm:rounded-2xl">
+
           {/* Header */}
           <div className="bg-blue-600 p-4 text-white flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-              <span className="font-semibold text-sm">Online Support</span>
+              <div className={`w-2 h-2 rounded-full ${headerDotColor()}`} />
+              <span className="font-semibold text-sm">{headerStatus()}</span>
             </div>
-            <div className="flex gap-2">
-              <button
-                onClick={() => setIsOpen(false)}
-                className="hover:bg-blue-500 p-1 rounded transition-colors"
-              >
-                <X size={18} />
-              </button>
-            </div>
+            <button onClick={() => setIsOpen(false)} className="hover:bg-blue-500 p-1 rounded transition-colors">
+              <X size={18} />
+            </button>
           </div>
 
-          {/* Messages / Feedback */}
-          <div
-            ref={scrollRef}
-            className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50"
-          >
+          {/* Body */}
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50">
             {showFeedback ? (
-              // ... existing feedback UI
               <div className="flex flex-col items-center justify-center h-full text-center space-y-4">
                 <h3 className="font-bold text-slate-800">Support Chat Ended</h3>
-                <p className="text-xs text-slate-500">
-                  How would you rate our support?
-                </p>
+                <p className="text-xs text-slate-500">How would you rate our support?</p>
                 <div className="flex gap-1">
                   {[1, 2, 3, 4, 5].map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => setRating(s)}
-                      className={`text-2xl transition-all hover:scale-110 active:scale-90 ${rating >= s ? "text-yellow-400" : "text-slate-200"}`}
-                    >
+                    <button key={s} onClick={() => setRating(s)}
+                      className={`text-2xl transition-all hover:scale-110 active:scale-90 ${rating >= s ? "text-yellow-400" : "text-slate-200"}`}>
                       <Star fill={rating >= s ? "currentColor" : "none"} />
                     </button>
                   ))}
                 </div>
                 <div className="w-full text-left space-y-3">
-                  <Checkbox
-                    label="Problem resolved?"
-                    checked={isResolved}
-                    onChange={setIsResolved}
-                  />
-                  <Input
-                    placeholder="Any feedback..."
-                    value={comment}
-                    onChange={(e) => setComment(e.target.value)}
-                    className="h-20"
-                  />
+                  <Checkbox label="Problem resolved?" checked={isResolved} onChange={setIsResolved} />
+                  <Input placeholder="Any feedback..." value={comment} onChange={(e) => setComment(e.target.value)} className="h-20" />
                 </div>
-                <Button
-                  onClick={submitFeedback}
-                  disabled={rating === 0}
-                  className="w-full mt-4"
-                  size="lg"
-                >
-                  Submit & Close
+                <Button onClick={submitFeedback} disabled={rating === 0} className="w-full mt-4" size="lg">
+                  Submit &amp; Close
                 </Button>
               </div>
             ) : step === "form" && !room ? (
-              <form
-                id="chat-init-form"
-                onSubmit={startChat}
-                className="space-y-4 py-4"
-              >
+              <form id="chat-init-form" onSubmit={startChat} className="space-y-4 py-4">
                 <div className="text-center mb-6">
-                  <h3 className="font-bold text-slate-800 text-lg">
-                    Start Conversation
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Please provide your details to connect with our team.
-                  </p>
+                  <h3 className="font-bold text-slate-800 text-lg">Start Conversation</h3>
+                  <p className="text-xs text-slate-500">Please provide your details to connect with our team.</p>
                 </div>
                 <div className="space-y-4">
-                  <Input
-                    label="Full Name"
-                    required
-                    value={clientInfo.name}
-                    onChange={(e) =>
-                      setClientInfo((prev) => ({
-                        ...prev,
-                        name: e.target.value,
-                      }))
-                    }
-                    placeholder="Enter your name"
-                  />
-                  <Input
-                    label="Email or Phone"
-                    required
-                    value={clientInfo.contact}
-                    onChange={(e) =>
-                      setClientInfo((prev) => ({
-                        ...prev,
-                        contact: e.target.value,
-                      }))
-                    }
-                    placeholder="e.g. john@example.com"
-                  />
-                  <Select
-                    label="What is your problem?"
-                    value={clientInfo.topic}
-                    onChange={(val) =>
-                      setClientInfo((prev) => ({
-                        ...prev,
-                        topic: val,
-                      }))
-                    }
+                  <Input label="Full Name" required value={clientInfo.name}
+                    onChange={(e) => setClientInfo((p) => ({ ...p, name: e.target.value }))}
+                    placeholder="Enter your name" />
+                  <Input label="Email or Phone" required value={clientInfo.contact}
+                    onChange={(e) => setClientInfo((p) => ({ ...p, contact: e.target.value }))}
+                    placeholder="e.g. john@example.com" />
+                  <Select label="What is your problem?" value={clientInfo.topic}
+                    onChange={(val) => setClientInfo((p) => ({ ...p, topic: val }))}
                     options={[
                       { label: "General Support", value: "General Support" },
                       { label: "Technical Issue", value: "Technical Issue" },
-                      {
-                        label: "Billing & Payments",
-                        value: "Billing & Payments",
-                      },
+                      { label: "Billing & Payments", value: "Billing & Payments" },
                       { label: "Sales Inquiry", value: "Sales Inquiry" },
-                    ]}
-                  />
+                    ]} />
                 </div>
               </form>
             ) : (
               <>
-                {messages.length === 0 && (
-                  <div className="text-center text-slate-400 mt-10">
-                    <p className="text-sm">
-                      {room?.operatorId
-                        ? "Operator connected!"
-                        : "Connecting you to an operator..."}
-                    </p>
-                    <p className="text-[10px] uppercase font-bold tracking-widest mt-2">
-                      {clientInfo.topic}
-                    </p>
+                {/* Status banners */}
+                {(room?.requestedOperator || requestingOperator) && !room?.operatorId && (
+                  <div className="flex items-center gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 text-amber-700 text-xs font-medium">
+                    <Loader2 size={14} className="animate-spin shrink-0" />
+                    <span>Waiting for a human operator to join…</span>
                   </div>
                 )}
-                {messages.map((msg, idx) => (
-                  <div
-                    key={idx}
-                    className={`flex ${msg.senderType === "client" ? "justify-end" : "justify-start"}`}
-                  >
-                    <div
-                      className={`max-w-[85%] p-3 rounded-2xl text-sm shadow-sm ${
-                        msg.senderType === "client"
+                {room?.operatorId && (
+                  <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2 text-emerald-700 text-xs font-medium">
+                    <UserCheck size={14} className="shrink-0" />
+                    <span>A support operator has joined the chat.</span>
+                  </div>
+                )}
+
+                {/* Persisted messages */}
+                {messages.map((msg) => {
+                  const isClient = msg.senderType === "client";
+                  const isBot = msg.senderType === "bot";
+                  return (
+                    <div key={msg.id} className={`flex ${isClient ? "justify-end" : "justify-start"} items-end gap-2`}>
+                      {isBot && (
+                        <div className="w-7 h-7 rounded-full bg-violet-100 flex items-center justify-center shrink-0 mb-1">
+                          <Bot size={14} className="text-violet-600" />
+                        </div>
+                      )}
+                      <div className={`max-w-[85%] p-3 rounded-2xl text-sm shadow-sm ${
+                        isClient
                           ? "bg-blue-600 text-white rounded-tr-none"
+                          : isBot
+                          ? "bg-violet-50 text-slate-800 rounded-tl-none border border-violet-200"
                           : "bg-white text-slate-800 rounded-tl-none border border-slate-200"
-                      }`}
-                    >
-                      {msg.content}
+                      }`}>
+                        {isBot && (
+                          <span className="block text-[10px] text-violet-500 font-semibold uppercase tracking-wide mb-1">
+                            Mainframe AI
+                          </span>
+                        )}
+                        <span className="whitespace-pre-wrap break-words leading-relaxed">
+                          {isBot ? renderBotText(msg.content) : msg.content}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {/* Live streaming bubble — grows as chunks arrive */}
+                {streamingMsg && (
+                  <div className="flex justify-start items-end gap-2 animate-fade-in">
+                    <div className="w-7 h-7 rounded-full bg-violet-100 flex items-center justify-center shrink-0 mb-1">
+                      <Bot size={14} className="text-violet-600" />
+                    </div>
+                    <div className="max-w-[85%] bg-violet-50 border border-violet-200 rounded-2xl rounded-tl-none p-3 text-sm text-slate-800 shadow-sm">
+                      <span className="block text-[10px] text-violet-500 font-semibold uppercase tracking-wide mb-1">
+                        Mainframe AI
+                      </span>
+                      <span className="whitespace-pre-wrap break-words leading-relaxed">
+                        {renderBotText(streamingMsg.content)}
+                        {/* blinking cursor while streaming */}
+                        <span className="inline-block w-[2px] h-[14px] bg-violet-400 ml-[1px] align-middle animate-pulse" />
+                      </span>
                     </div>
                   </div>
-                ))}
+                )}
+
+                {/* Animated thinking steps UI */}
+                {(botIsTyping || currentSteps.length > 0) && !streamingMsg && (
+                  <div className="flex flex-col gap-2 pl-9 animate-in fade-in duration-300">
+                    <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mb-1">
+                      Analyzing request...
+                    </div>
+                    {currentSteps.map((s) => (
+                      <div key={s.step} className="flex items-center gap-2 text-xs text-slate-600 bg-slate-100 border border-slate-200/60 rounded-xl px-3 py-2 animate-in slide-in-from-left-2 duration-200">
+                        <Loader2 size={12} className="animate-spin text-blue-500 shrink-0" />
+                        <span>{s.text}</span>
+                      </div>
+                    ))}
+
+                    {/* Three-dot indicator — shown only until first chunk lands */}
+                    {botIsTyping && currentSteps.length === 0 && (
+                      <div className="bg-violet-50 border border-violet-200 rounded-2xl rounded-tl-none px-4 py-3 flex items-center gap-1 w-fit shadow-sm">
+                        <span className="w-1.5 h-1.5 bg-violet-400 rounded-full animate-bounce [animation-delay:0ms]" />
+                        <span className="w-1.5 h-1.5 bg-violet-400 rounded-full animate-bounce [animation-delay:150ms]" />
+                        <span className="w-1.5 h-1.5 bg-violet-400 rounded-full animate-bounce [animation-delay:300ms]" />
+                      </div>
+                    )}
+                  </div>
+                )}
               </>
             )}
           </div>
 
-          {/* Input */}
+          {/* Footer */}
           {!showFeedback && (
-            <div className="p-4 bg-white border-t border-slate-100 flex gap-2 items-center">
-              {step === "chat" ? (
-                <>
-                  <Input
-                    value={message}
-                    onChange={(e) => setMessage(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                    placeholder="Write a message..."
-                    className="flex-1 h-10 rounded-full"
-                  />
-                  <Button
-                    onClick={sendMessage}
-                    disabled={!isConnected}
-                    size="icon"
-                    className="rounded-full shrink-0"
-                  >
-                    <Send size={16} />
-                  </Button>
-                </>
-              ) : (
-                <Button
-                  type="submit"
-                  form="chat-init-form"
-                  disabled={!isConnected}
-                  className="w-full"
-                  size="lg"
-                  isLoading={!isConnected && step === "form"}
-                >
-                  Start Chatting
-                </Button>
+            <div className="bg-white border-t border-slate-100">
+              {step === "chat" && room && !room.operatorId && !room.requestedOperator && !requestingOperator && (
+                <div className="px-4 pt-3">
+                  <button onClick={requestOperator}
+                    className="w-full flex items-center justify-center gap-2 text-xs text-slate-500 hover:text-blue-600 hover:bg-blue-50 border border-slate-200 hover:border-blue-200 rounded-lg py-2 px-3 transition-all">
+                    <UserCheck size={13} />
+                    Talk to a human operator
+                  </button>
+                </div>
               )}
+              <div className="p-4 flex gap-2 items-center">
+                {step === "chat" ? (
+                  <>
+                    <Input value={message} onChange={(e) => setMessage(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                      placeholder="Write a message…" className="flex-1 h-10 rounded-full" />
+                    <Button onClick={sendMessage} disabled={!isConnected || !!streamingMsg} size="icon" className="rounded-full shrink-0">
+                      <Send size={16} />
+                    </Button>
+                  </>
+                ) : (
+                  <Button type="submit" form="chat-init-form" disabled={!isConnected} className="w-full" size="lg"
+                    isLoading={!isConnected && step === "form"}>
+                    Start Chatting
+                  </Button>
+                )}
+              </div>
             </div>
           )}
         </div>
