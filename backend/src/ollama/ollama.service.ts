@@ -122,18 +122,24 @@ ${productContext
 
   /**
    * Search products DB → inject context → stream reply.
+   * onStep fires at each named stage so the gateway can relay progress to the client.
    */
   async chatWithProductContextStream(
     userMessage: string,
     history: OllamaMessage[],
     topic: string | undefined,
     onChunk: (chunk: string) => void,
+    onStep?: (step: number, text: string) => void,
   ): Promise<string> {
+    onStep?.(1, 'Analyzing your question…');
+
     // Limit to 5 products to keep the prompt compact → faster generation
     const products = await this.productsService.searchProducts(userMessage);
     const topProducts = products.slice(0, 5);
-    const productContext = this.productsService.formatProductsForPrompt(topProducts);
 
+    onStep?.(2, `Searching our product catalog${topProducts.length ? ` — found ${topProducts.length} match${topProducts.length > 1 ? 'es' : ''}` : ' — no exact matches'}…`);
+
+    const productContext = this.productsService.formatProductsForPrompt(topProducts);
     const systemPrompt = this.buildSystemPrompt(topic, productContext);
     const messages: OllamaMessage[] = [
       ...history,

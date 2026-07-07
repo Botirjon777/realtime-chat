@@ -66,6 +66,8 @@ export default function ChatWidget() {
   const [streamingMsg, setStreamingMsg] = useState<StreamingMsg | null>(null);
   // botIsTyping: three-dot indicator shown while waiting for the FIRST chunk
   const [botIsTyping, setBotIsTyping] = useState(false);
+  // currentSteps: list of steps currently executed by the backend
+  const [currentSteps, setCurrentSteps] = useState<{ step: number; text: string }[]>([]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -107,6 +109,14 @@ export default function ChatWidget() {
     socket.on("bot:stream_start", () => {
       setBotIsTyping(true);
       setStreamingMsg(null);
+      setCurrentSteps([]);
+    });
+
+    socket.on("bot:step", ({ step, text }: { step: number; text: string }) => {
+      setCurrentSteps((prev) => {
+        const filtered = prev.filter((s) => s.step !== step);
+        return [...filtered, { step, text }].sort((a, b) => a.step - b.step);
+      });
     });
 
     // A chunk of the bot reply arrived → hide dots, grow the streaming bubble
@@ -127,6 +137,7 @@ export default function ChatWidget() {
     socket.on("bot:stream_done", ({ message: savedMsg }: { message: ChatMessage }) => {
       setStreamingMsg(null);
       setMessages((prev) => [...prev, savedMsg]);
+      setCurrentSteps([]);
     });
 
     socket.on("bot:typing", () => {
@@ -343,7 +354,7 @@ export default function ChatWidget() {
 
                 {/* Live streaming bubble — grows as chunks arrive */}
                 {streamingMsg && (
-                  <div className="flex justify-start items-end gap-2">
+                  <div className="flex justify-start items-end gap-2 animate-fade-in">
                     <div className="w-7 h-7 rounded-full bg-violet-100 flex items-center justify-center shrink-0 mb-1">
                       <Bot size={14} className="text-violet-600" />
                     </div>
@@ -360,17 +371,27 @@ export default function ChatWidget() {
                   </div>
                 )}
 
-                {/* Three-dot indicator — shown only until first chunk lands */}
-                {botIsTyping && !streamingMsg && (
-                  <div className="flex justify-start items-end gap-2">
-                    <div className="w-7 h-7 rounded-full bg-violet-100 flex items-center justify-center shrink-0">
-                      <Bot size={14} className="text-violet-600" />
+                {/* Animated thinking steps UI */}
+                {(botIsTyping || currentSteps.length > 0) && !streamingMsg && (
+                  <div className="flex flex-col gap-2 pl-9 animate-in fade-in duration-300">
+                    <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mb-1">
+                      Analyzing request...
                     </div>
-                    <div className="bg-violet-50 border border-violet-200 rounded-2xl rounded-tl-none px-4 py-3 flex items-center gap-1 shadow-sm">
-                      <span className="w-1.5 h-1.5 bg-violet-400 rounded-full animate-bounce [animation-delay:0ms]" />
-                      <span className="w-1.5 h-1.5 bg-violet-400 rounded-full animate-bounce [animation-delay:150ms]" />
-                      <span className="w-1.5 h-1.5 bg-violet-400 rounded-full animate-bounce [animation-delay:300ms]" />
-                    </div>
+                    {currentSteps.map((s) => (
+                      <div key={s.step} className="flex items-center gap-2 text-xs text-slate-600 bg-slate-100 border border-slate-200/60 rounded-xl px-3 py-2 animate-in slide-in-from-left-2 duration-200">
+                        <Loader2 size={12} className="animate-spin text-blue-500 shrink-0" />
+                        <span>{s.text}</span>
+                      </div>
+                    ))}
+
+                    {/* Three-dot indicator — shown only until first chunk lands */}
+                    {botIsTyping && currentSteps.length === 0 && (
+                      <div className="bg-violet-50 border border-violet-200 rounded-2xl rounded-tl-none px-4 py-3 flex items-center gap-1 w-fit shadow-sm">
+                        <span className="w-1.5 h-1.5 bg-violet-400 rounded-full animate-bounce [animation-delay:0ms]" />
+                        <span className="w-1.5 h-1.5 bg-violet-400 rounded-full animate-bounce [animation-delay:150ms]" />
+                        <span className="w-1.5 h-1.5 bg-violet-400 rounded-full animate-bounce [animation-delay:300ms]" />
+                      </div>
+                    )}
                   </div>
                 )}
               </>

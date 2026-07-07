@@ -228,7 +228,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         const tempId = Date.now();
         this.server.to(data.roomId).emit('bot:stream_start', { roomId: data.roomId, tempId });
 
-        // Stream chunks to the room as Ollama generates them
+        // Stream chunks and steps to the room
         const fullReply = await this.ollamaService.chatWithProductContextStream(
           data.content,
           history,
@@ -236,6 +236,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
           (chunk: string) => {
             this.server.to(data.roomId).emit('bot:chunk', { roomId: data.roomId, tempId, chunk });
           },
+          (step: number, text: string) => {
+            this.server.to(data.roomId).emit('bot:step', { roomId: data.roomId, tempId, step, text });
+          }
         );
 
         // Save the complete message and notify the client to replace streaming bubble
